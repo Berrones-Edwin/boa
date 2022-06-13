@@ -264,9 +264,9 @@ impl Function {
     }
 
     ///  Sets the `[[HomeObject]]` slot if present.
-    pub(crate) fn set_home_object(&mut self, object: &JsObject) {
+    pub(crate) fn set_home_object(&mut self, object: JsObject) {
         if let Self::Ordinary { home_object, .. } = self {
-            *home_object = Some(object.clone());
+            *home_object = Some(object);
         }
     }
 

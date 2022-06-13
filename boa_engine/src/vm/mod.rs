@@ -260,7 +260,7 @@ impl Context {
                     let class_function = class_object_mut
                         .as_function_mut()
                         .expect("class must be function object");
-                    class_function.set_home_object(&proto);
+                    class_function.set_home_object(proto.clone());
                 }
 
                 proto
@@ -288,7 +288,7 @@ impl Context {
                     .borrow_mut()
                     .as_function_mut()
                     .expect("must be function object")
-                    .set_home_object(home_object);
+                    .set_home_object(home_object.clone());
 
                 self.vm.push(home);
                 self.vm.push(function);
@@ -802,7 +802,7 @@ impl Context {
                     .borrow_mut()
                     .as_function_mut()
                     .expect("method must be function object")
-                    .set_home_object(&object);
+                    .set_home_object(object.clone());
                 let name = self.vm.frame().code.names[index as usize];
                 let name = self.interner().resolve_expect(name);
                 object.__define_own_property__(
@@ -865,7 +865,7 @@ impl Context {
                     .borrow_mut()
                     .as_function_mut()
                     .expect("method must be function object")
-                    .set_home_object(&object);
+                    .set_home_object(object.clone());
                 let key = key.to_property_key(self)?;
                 object.__define_own_property__(
                     key,
@@ -912,7 +912,7 @@ impl Context {
                     .borrow_mut()
                     .as_function_mut()
                     .expect("method must be function object")
-                    .set_home_object(&object);
+                    .set_home_object(object.clone());
                 let name = self.vm.frame().code.names[index as usize];
                 let name = self.interner().resolve_expect(name).into();
                 let set = object
@@ -964,7 +964,7 @@ impl Context {
                     .borrow_mut()
                     .as_function_mut()
                     .expect("method must be function object")
-                    .set_home_object(&object);
+                    .set_home_object(object.clone());
                 let name = key.to_property_key(self)?;
                 let set = object
                     .__get_own_property__(&name, self)?
@@ -1016,7 +1016,7 @@ impl Context {
                     .borrow_mut()
                     .as_function_mut()
                     .expect("method must be function object")
-                    .set_home_object(&object);
+                    .set_home_object(object.clone());
                 let name = self.vm.frame().code.names[index as usize];
                 let name = self.interner().resolve_expect(name).into();
                 let get = object
@@ -1068,7 +1068,7 @@ impl Context {
                     .borrow_mut()
                     .as_function_mut()
                     .expect("method must be function object")
-                    .set_home_object(&object);
+                    .set_home_object(object.clone());
                 let name = key.to_property_key(self)?;
                 let get = object
                     .__get_own_property__(&name, self)?
@@ -1228,7 +1228,7 @@ impl Context {
                 let class_object = class_value
                     .as_object()
                     .expect("class must be function object");
-                field_function.set_home_object(class_object);
+                field_function.set_home_object(class_object.clone());
                 class_object
                     .borrow_mut()
                     .as_function_mut()
@@ -1254,7 +1254,7 @@ impl Context {
                 let class_object = class_value
                     .as_object()
                     .expect("class must be function object");
-                field_function.set_home_object(class_object);
+                field_function.set_home_object(class_object.clone());
                 class_object
                     .borrow_mut()
                     .as_function_mut()
