@@ -11,7 +11,8 @@ use crate::{
             object::{MethodDefinition, PropertyDefinition, PropertyName},
             operator::assign::AssignTarget,
             template::TemplateElement,
-            Class, Declaration, FormalParameterList, GetConstField, GetField, StatementList,
+            Class, Declaration, FormalParameterList, GetConstField, GetField, GetSuperField,
+            StatementList,
         },
         op::{AssignOp, BinOp, BitOp, CompOp, LogOp, NumOp, UnaryOp},
         Const, Node,
@@ -1003,7 +1004,7 @@ impl<'b> ByteCompiler<'b> {
                     self.compile_expr(node.obj(), true)?;
                     self.emit_opcode(Opcode::Swap);
                     let index = self.get_or_insert_name(node.field());
-                    self.emit(Opcode::SetPrivateValue, &[index]);
+                    self.emit(Opcode::AssignPrivateField, &[index]);
                 }
                 AssignTarget::GetConstField(node) => {
                     self.access_set(Access::ByName { node }, Some(assign.rhs()), use_expr)?;
@@ -1032,6 +1033,24 @@ impl<'b> ByteCompiler<'b> {
                 let access = Access::ByValue { node };
                 self.access_get(access, use_expr)?;
             }
+            Node::GetSuperField(get_super_field) => match get_super_field {
+                GetSuperField::Const(field) => {
+                    let index = self.get_or_insert_name(*field);
+                    self.emit_opcode(Opcode::Super);
+                    self.emit(Opcode::GetPropertyByName, &[index]);
+                    if !use_expr {
+                        self.emit_opcode(Opcode::Pop);
+                    }
+                }
+                GetSuperField::Expr(expr) => {
+                    self.compile_expr(expr, true)?;
+                    self.emit_opcode(Opcode::Super);
+                    self.emit_opcode(Opcode::GetPropertyByValue);
+                    if !use_expr {
+                        self.emit_opcode(Opcode::Pop);
+                    }
+                }
+            },
             Node::ConditionalOp(op) => {
                 self.compile_expr(op.cond(), true)?;
                 let jelse = self.jump_if_false();
@@ -1181,6 +1200,24 @@ impl<'b> ByteCompiler<'b> {
                 self.emit(Opcode::Call, &[(template.exprs().len() + 1) as u32]);
             }
             Node::ClassExpr(class) => self.class(class, true)?,
+            Node::SuperCall(super_call) => {
+                for arg in super_call.args() {
+                    self.compile_expr(arg, true)?;
+                }
+
+                let last_is_rest_parameter =
+                    matches!(super_call.args().last(), Some(Node::Spread(_)));
+
+                if last_is_rest_parameter {
+                    self.emit(Opcode::SuperCallWithRest, &[super_call.args().len() as u32]);
+                } else {
+                    self.emit(Opcode::SuperCall, &[super_call.args().len() as u32]);
+                }
+
+                if !use_expr {
+                    self.emit_opcode(Opcode::Pop);
+                }
+            }
             _ => unreachable!(),
         }
         Ok(())
@@ -1194,10 +1231,6 @@ impl<'b> ByteCompiler<'b> {
                     match decl {
                         Declaration::Identifier { ident, .. } => {
                             let ident = ident.sym();
-                            if ident == Sym::ARGUMENTS {
-                                self.code_block.lexical_name_argument = true;
-                            }
-
                             if let Some(expr) = decl.init() {
                                 self.compile_expr(expr, true)?;
                                 self.emit_binding(BindingOpcode::InitVar, ident);
@@ -1206,10 +1239,6 @@ impl<'b> ByteCompiler<'b> {
                             }
                         }
                         Declaration::Pattern(pattern) => {
-                            if pattern.idents().contains(&Sym::ARGUMENTS) {
-                                self.code_block.lexical_name_argument = true;
-                            }
-
                             if let Some(init) = decl.init() {
                                 self.compile_expr(init, true)?;
                             } else {
@@ -1225,10 +1254,6 @@ impl<'b> ByteCompiler<'b> {
                 for decl in list.as_ref() {
                     match decl {
                         Declaration::Identifier { ident, .. } => {
-                            if ident.sym() == Sym::ARGUMENTS {
-                                self.code_block.lexical_name_argument = true;
-                            }
-
                             if let Some(expr) = decl.init() {
                                 self.compile_expr(expr, true)?;
                                 self.emit_binding(BindingOpcode::InitLet, ident.sym());
@@ -1237,10 +1262,6 @@ impl<'b> ByteCompiler<'b> {
                             }
                         }
                         Declaration::Pattern(pattern) => {
-                            if pattern.idents().contains(&Sym::ARGUMENTS) {
-                                self.code_block.lexical_name_argument = true;
-                            }
-
                             if let Some(init) = decl.init() {
                                 self.compile_expr(init, true)?;
                             } else {
@@ -1256,9 +1277,6 @@ impl<'b> ByteCompiler<'b> {
                 for decl in list.as_ref() {
                     match decl {
                         Declaration::Identifier { ident, .. } => {
-                            if ident.sym() == Sym::ARGUMENTS {
-                                self.code_block.lexical_name_argument = true;
-                            }
                             let init = decl
                                 .init()
                                 .expect("const declaration must have initializer");
@@ -1266,10 +1284,6 @@ impl<'b> ByteCompiler<'b> {
                             self.emit_binding(BindingOpcode::InitConst, ident.sym());
                         }
                         Declaration::Pattern(pattern) => {
-                            if pattern.idents().contains(&Sym::ARGUMENTS) {
-                                self.code_block.lexical_name_argument = true;
-                            }
-
                             if let Some(init) = decl.init() {
                                 self.compile_expr(init, true)?;
                             } else {
@@ -2503,8 +2517,7 @@ impl<'b> ByteCompiler<'b> {
     /// A class declaration binds the resulting class object to it's identifier.
     /// A class expression leaves the resulting class object on the stack for following operations.
     fn class(&mut self, class: &Class, expression: bool) -> JsResult<()> {
-        let mut code = CodeBlock::new(class.name(), 0, true, true);
-        code.computed_field_names = Some(gc::GcCell::new(vec![]));
+        let code = CodeBlock::new(class.name(), 0, true, true);
         let mut compiler = ByteCompiler {
             code_block: code,
             literals_map: FxHashMap::default(),
@@ -2514,47 +2527,6 @@ impl<'b> ByteCompiler<'b> {
             context: self.context,
         };
         compiler.context.push_compile_time_environment(true);
-
-        for element in class.elements() {
-            match element {
-                ClassElement::FieldDefinition(name, field) => {
-                    compiler.emit_opcode(Opcode::This);
-                    match name {
-                        PropertyName::Literal(name) => {
-                            if let Some(node) = field {
-                                compiler.compile_stmt(node, true)?;
-                            } else {
-                                compiler.emit_opcode(Opcode::PushUndefined);
-                            }
-                            compiler.emit_opcode(Opcode::Swap);
-                            let index = compiler.get_or_insert_name(*name);
-                            compiler.emit(Opcode::DefineOwnPropertyByName, &[index]);
-                        }
-                        PropertyName::Computed(_) => {
-                            compiler.emit_opcode(Opcode::Swap);
-                            compiler.emit_opcode(Opcode::ToPropertyKey);
-                            if let Some(node) = field {
-                                compiler.compile_stmt(node, true)?;
-                            } else {
-                                compiler.emit_opcode(Opcode::PushUndefined);
-                            }
-                            compiler.emit_opcode(Opcode::DefineOwnPropertyByValue);
-                        }
-                    }
-                }
-                ClassElement::PrivateFieldDefinition(name, field) => {
-                    compiler.emit_opcode(Opcode::This);
-                    if let Some(node) = field {
-                        compiler.compile_stmt(node, true)?;
-                    } else {
-                        compiler.emit_opcode(Opcode::PushUndefined);
-                    }
-                    let index = compiler.get_or_insert_name(*name);
-                    compiler.emit(Opcode::SetPrivateValue, &[index]);
-                }
-                _ => {}
-            }
-        }
 
         if let Some(expr) = class.constructor() {
             compiler.code_block.length = expr.parameters().length();
@@ -2620,8 +2592,12 @@ impl<'b> ByteCompiler<'b> {
                     .compile_environments
                     .push(compile_environment);
                 compiler.code_block.num_bindings = num_bindings;
+                compiler.code_block.is_class_constructor = true;
             }
         } else {
+            if class.super_ref().is_some() {
+                compiler.emit_opcode(Opcode::SuperCallDerived);
+            }
             let (num_bindings, compile_environment) =
                 compiler.context.pop_compile_time_environment();
             compiler
@@ -2629,6 +2605,7 @@ impl<'b> ByteCompiler<'b> {
                 .compile_environments
                 .push(compile_environment);
             compiler.code_block.num_bindings = num_bindings;
+            compiler.code_block.is_class_constructor = true;
         }
 
         compiler.emit_opcode(Opcode::PushUndefined);
@@ -2638,6 +2615,16 @@ impl<'b> ByteCompiler<'b> {
         let index = self.code_block.functions.len() as u32;
         self.code_block.functions.push(code);
         self.emit(Opcode::GetFunction, &[index]);
+
+        self.emit_opcode(Opcode::Dup);
+        if let Some(node) = class.super_ref() {
+            self.compile_expr(node, true)?;
+            self.emit_opcode(Opcode::PushClassPrototype);
+        } else {
+            self.emit_opcode(Opcode::PushUndefined);
+        }
+        self.emit_opcode(Opcode::SetClassPrototype);
+        self.emit_opcode(Opcode::Swap);
 
         for element in class.elements() {
             match element {
@@ -2720,22 +2707,91 @@ impl<'b> ByteCompiler<'b> {
                         MethodDefinition::Ordinary(expr) => {
                             self.function(&expr.clone().into(), true)?;
                             let index = self.get_or_insert_name(*name);
-                            self.emit(Opcode::SetPrivateValue, &[index]);
+                            self.emit(Opcode::SetPrivateMethod, &[index]);
                         }
                         MethodDefinition::Generator(expr) => {
                             self.function(&expr.clone().into(), true)?;
                             let index = self.get_or_insert_name(*name);
-                            self.emit(Opcode::SetPrivateValue, &[index]);
+                            self.emit(Opcode::SetPrivateMethod, &[index]);
                         }
                         // TODO: implement async
                         MethodDefinition::AsyncGenerator(_) | MethodDefinition::Async(_) => {}
                     }
                 }
-                ClassElement::FieldDefinition(PropertyName::Computed(name_node), _) => {
+                ClassElement::FieldDefinition(name, field) => {
                     self.emit_opcode(Opcode::Dup);
-                    self.compile_stmt(name_node, true)?;
-                    self.emit_opcode(Opcode::Swap);
-                    self.emit_opcode(Opcode::PushClassComputedFieldName);
+                    match name {
+                        PropertyName::Literal(name) => {
+                            self.emit_push_literal(Literal::String(
+                                self.interner().resolve_expect(*name).into(),
+                            ));
+                        }
+                        PropertyName::Computed(name) => {
+                            self.compile_expr(name, true)?;
+                        }
+                    }
+                    let field_code = CodeBlock::new(Sym::EMPTY_STRING, 0, true, true);
+                    let mut field_compiler = ByteCompiler {
+                        code_block: field_code,
+                        literals_map: FxHashMap::default(),
+                        names_map: FxHashMap::default(),
+                        bindings_map: FxHashMap::default(),
+                        jump_info: Vec::new(),
+                        context: self.context,
+                    };
+                    field_compiler.context.push_compile_time_environment(true);
+                    if let Some(node) = field {
+                        field_compiler.compile_stmt(node, true)?;
+                    } else {
+                        field_compiler.emit_opcode(Opcode::PushUndefined);
+                    }
+                    let (num_bindings, compile_environment) =
+                        field_compiler.context.pop_compile_time_environment();
+                    field_compiler
+                        .code_block
+                        .compile_environments
+                        .push(compile_environment);
+                    field_compiler.code_block.num_bindings = num_bindings;
+                    field_compiler.emit_opcode(Opcode::Return);
+
+                    let code = Gc::new(field_compiler.finish());
+                    let index = self.code_block.functions.len() as u32;
+                    self.code_block.functions.push(code);
+                    self.emit(Opcode::GetFunction, &[index]);
+                    self.emit_opcode(Opcode::PushClassField);
+                }
+                ClassElement::PrivateFieldDefinition(name, field) => {
+                    self.emit_opcode(Opcode::Dup);
+                    let name_index = self.get_or_insert_name(*name);
+                    let field_code = CodeBlock::new(Sym::EMPTY_STRING, 0, true, true);
+                    let mut field_compiler = ByteCompiler {
+                        code_block: field_code,
+                        literals_map: FxHashMap::default(),
+                        names_map: FxHashMap::default(),
+                        bindings_map: FxHashMap::default(),
+                        jump_info: Vec::new(),
+                        context: self.context,
+                    };
+                    field_compiler.context.push_compile_time_environment(true);
+                    if let Some(node) = field {
+                        field_compiler.compile_stmt(node, true)?;
+                    } else {
+                        field_compiler.emit_opcode(Opcode::PushUndefined);
+                    }
+                    let (num_bindings, compile_environment) =
+                        field_compiler.context.pop_compile_time_environment();
+                    field_compiler
+                        .code_block
+                        .compile_environments
+                        .push(compile_environment);
+                    field_compiler.code_block.num_bindings = num_bindings;
+                    field_compiler.emit_opcode(Opcode::Return);
+
+                    let code = Gc::new(field_compiler.finish());
+                    let index = self.code_block.functions.len() as u32;
+                    self.code_block.functions.push(code);
+                    self.emit(Opcode::GetFunction, &[index]);
+                    self.emit(Opcode::PushClassFieldPrivate, &[name_index]);
                 }
                 ClassElement::StaticFieldDefinition(name, field) => {
                     self.emit_opcode(Opcode::Dup);
@@ -2770,7 +2826,7 @@ impl<'b> ByteCompiler<'b> {
                         self.emit_opcode(Opcode::PushUndefined);
                     }
                     let index = self.get_or_insert_name(*name);
-                    self.emit(Opcode::SetPrivateValue, &[index]);
+                    self.emit(Opcode::SetPrivateField, &[index]);
                 }
                 ClassElement::StaticBlock(statement_list) => {
                     self.emit_opcode(Opcode::Dup);
@@ -2790,24 +2846,42 @@ impl<'b> ByteCompiler<'b> {
                     let index = self.code_block.functions.len() as u32;
                     self.code_block.functions.push(code);
                     self.emit(Opcode::GetFunction, &[index]);
+                    self.emit_opcode(Opcode::SetHomeObject);
                     self.emit(Opcode::Call, &[0]);
                     self.emit_opcode(Opcode::Pop);
                 }
-                ClassElement::MethodDefinition(..)
-                | ClassElement::PrivateMethodDefinition(..)
-                | ClassElement::PrivateFieldDefinition(..)
-                | ClassElement::FieldDefinition(..) => {}
+                ClassElement::PrivateMethodDefinition(name, method_definition) => {
+                    self.emit_opcode(Opcode::Dup);
+                    match method_definition {
+                        MethodDefinition::Get(expr) => {
+                            self.function(&expr.clone().into(), true)?;
+                            let index = self.get_or_insert_name(*name);
+                            self.emit(Opcode::PushClassPrivateGetter, &[index]);
+                        }
+                        MethodDefinition::Set(expr) => {
+                            self.function(&expr.clone().into(), true)?;
+                            let index = self.get_or_insert_name(*name);
+                            self.emit(Opcode::PushClassPrivateSetter, &[index]);
+                        }
+                        MethodDefinition::Ordinary(expr) => {
+                            self.function(&expr.clone().into(), true)?;
+                            let index = self.get_or_insert_name(*name);
+                            self.emit(Opcode::PushClassPrivateMethod, &[index]);
+                        }
+                        MethodDefinition::Generator(expr) => {
+                            self.function(&expr.clone().into(), true)?;
+                            let index = self.get_or_insert_name(*name);
+                            self.emit(Opcode::PushClassPrivateMethod, &[index]);
+                        }
+                        // TODO: implement async
+                        MethodDefinition::AsyncGenerator(_) | MethodDefinition::Async(_) => {}
+                    }
+                }
+                ClassElement::MethodDefinition(..) => {}
             }
         }
 
-        self.emit_opcode(Opcode::Dup);
-
-        if let Some(node) = class.super_ref() {
-            self.compile_expr(node, true)?;
-            self.emit_opcode(Opcode::PushClassPrototype);
-        } else {
-            self.emit_opcode(Opcode::PushEmptyObject);
-        }
+        self.emit_opcode(Opcode::Swap);
 
         for element in class.elements() {
             match element {
@@ -2871,37 +2945,13 @@ impl<'b> ByteCompiler<'b> {
                             }
                         },
                         // TODO: implement async
-                        MethodDefinition::AsyncGenerator(_) | MethodDefinition::Async(_) => {}
+                        MethodDefinition::AsyncGenerator(_) | MethodDefinition::Async(_) => {
+                            self.emit_opcode(Opcode::Pop);
+                        }
                     }
                 }
-                ClassElement::PrivateMethodDefinition(name, method_definition) => {
-                    self.emit_opcode(Opcode::Dup);
-                    match method_definition {
-                        MethodDefinition::Get(expr) => {
-                            self.function(&expr.clone().into(), true)?;
-                            let index = self.get_or_insert_name(*name);
-                            self.emit(Opcode::SetPrivateGetter, &[index]);
-                        }
-                        MethodDefinition::Set(expr) => {
-                            self.function(&expr.clone().into(), true)?;
-                            let index = self.get_or_insert_name(*name);
-                            self.emit(Opcode::SetPrivateSetter, &[index]);
-                        }
-                        MethodDefinition::Ordinary(expr) => {
-                            self.function(&expr.clone().into(), true)?;
-                            let index = self.get_or_insert_name(*name);
-                            self.emit(Opcode::SetPrivateValue, &[index]);
-                        }
-                        MethodDefinition::Generator(expr) => {
-                            self.function(&expr.clone().into(), true)?;
-                            let index = self.get_or_insert_name(*name);
-                            self.emit(Opcode::SetPrivateValue, &[index]);
-                        }
-                        // TODO: implement async
-                        MethodDefinition::AsyncGenerator(_) | MethodDefinition::Async(_) => {}
-                    }
-                }
-                ClassElement::PrivateFieldDefinition(..)
+                ClassElement::PrivateMethodDefinition(..)
+                | ClassElement::PrivateFieldDefinition(..)
                 | ClassElement::StaticFieldDefinition(..)
                 | ClassElement::PrivateStaticFieldDefinition(..)
                 | ClassElement::StaticMethodDefinition(..)
@@ -2911,9 +2961,7 @@ impl<'b> ByteCompiler<'b> {
             }
         }
 
-        self.emit_opcode(Opcode::Swap);
-        let index = self.get_or_insert_name(Sym::PROTOTYPE);
-        self.emit(Opcode::SetPropertyByName, &[index]);
+        self.emit_opcode(Opcode::Pop);
 
         if !expression {
             self.emit_binding(BindingOpcode::InitVar, class.name());
